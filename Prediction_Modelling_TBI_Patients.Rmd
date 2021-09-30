@@ -1,0 +1,867 @@
+---
+title: "Prediction Modelling Assignment (2)"
+author: "AB12588"
+date: "27/02/2021"
+output: word_document
+---
+
+# Loading Libraries/Packages:
+
+```{r}
+###############################################################################################
+#install.packages(haven)
+library(haven)
+#install.packages(pmsampsize)
+library(pmsampsize)
+#install.packages(dplyr)
+library(dplyr)
+#install.packages(pROC)
+library(pROC)
+#install.packages(caret)
+library(caret)
+#install.packages(glmnet)
+library(glmnet)
+#install.packages(psych)
+library(psych)
+#install.packages(doParallel)
+library(doParallel)
+#install.packages(mice)
+library(mice) 
+#install.packages(DMwR)
+library(DMwR)
+#install.packages(pROC)
+library(pROC)
+#install.packages(e1071)
+library(e1071)
+#install.packages(MatrixModels)
+library(MatrixModels)
+################################################################################################
+```
+
+# Function(1): KNNLogisticLasso
+
+```{r}
+library(pROC)
+library(e1071)
+library(MatrixModels)
+library(caret)
+library(doParallel)
+require(DMwR)
+
+#FUNCTIONS NEEDED:__________________________________________________________________________________________________________________________________
+
+### A function to compute apparent performance ################################
+AppPerformanceKNNLassoLogistic<- function (coef,data,OutcomeName) {
+  
+  Outcome <- unlist(data[,OutcomeName])
+  levels(Outcome) <- c("noEvent","Event")
+  modelMatrix<- model.Matrix(as.formula(paste(OutcomeName,"~.",sep="")),data)  
+  X<-modelMatrix[,-1]   
+  Predicted  <-  as.matrix(exp(coef[1] + X%*%coef[-1])/(exp(coef[1] + X%*%coef[-1])+1))
+  Predicted[Predicted==1]  <- 0.999999999
+  Predicted[Predicted==0]  <- 0.000000001
+  
+  
+  roc_obj <- roc(Outcome, as.vector(Predicted), quiet = TRUE)
+  bestThreshold<-pROC::coords(roc_obj, "best", ret = "threshold",transpose=T)
+  PredictedClass<-factor(Predicted>0.5); levels(PredictedClass)<-c("noEvent","Event")
+  confMatrix50threshold<-confusionMatrix(PredictedClass, Outcome, positive="Event")
+  sensitivity<-confMatrix50threshold$byClass["Sensitivity"]
+  specificity<-confMatrix50threshold$byClass["Specificity"]
+  PPV<-confMatrix50threshold$byClass["Pos Pred Value"]
+  NPV<-confMatrix50threshold$byClass["Neg Pred Value"]
+  Accuracy<-confMatrix50threshold$overall["Accuracy"]
+  Kappa<-confMatrix50threshold$overall["Kappa"]
+  
+  if(bestThreshold[1]==-Inf ){
+    sensitivityBest<-NA
+    specificityBest<-NA
+    PPVBest<-NA
+    NPVBest<-NA
+    AccuracyBest<-NA
+    KappaBest<-NA
+    
+  } else {
+    PredictedClassBest<-factor(Predicted>bestThreshold[1]); levels(PredictedClassBest)<-c("noEvent","Event")
+    confMatrixBestthreshold<-confusionMatrix(PredictedClassBest, Outcome, positive="Event")
+    sensitivityBest<-confMatrixBestthreshold$byClass["Sensitivity"]
+    specificityBest<-confMatrixBestthreshold$byClass["Specificity"]
+    PPVBest<-confMatrixBestthreshold$byClass["Pos Pred Value"]
+    NPVBest<-confMatrixBestthreshold$byClass["Neg Pred Value"]
+    AccuracyBest<-confMatrixBestthreshold$overall["Accuracy"]
+    KappaBest<-confMatrixBestthreshold$overall["Kappa"]
+  }
+  roc_obj <- roc(Outcome, as.vector(Predicted),quiet = TRUE)
+  AUC   <-as.numeric(roc_obj$auc)
+  logOdds<-log(Predicted/(1-Predicted))
+  glm.coef.beta       <-  glm(Outcome ~ logOdds,family=binomial)$coef
+  Beta	 <-  glm.coef.beta[2]
+  glm.coef.alpha       <-  glm(Outcome ~ offset(logOdds),family=binomial)$coef
+  Alpha  <-  glm.coef.alpha[1]
+  
+  out.best.tol  <- list(AUC,Alpha,Beta,
+                        sensitivityBest,specificityBest,
+                        PPVBest,NPVBest,AccuracyBest,
+                        KappaBest,sensitivity,
+                        specificity,PPV,NPV,
+                        Accuracy,Kappa)
+  out.best.tol
+}
+
+
+#________________________________________________________________________________________________________________________________________________________
+
+# MAIN FUNCTION ###########################################################################################
+
+KnnLassoLogistic<- function (innerFolds,innerRepeats,Data.NA,OutcomeName,Grid,seed){
+    
+    # KNN imputation ###########
+    
+    ### Imputing training sample through KNN including outcome
+    data.imputed<- knnImputation(Data.NA, k=10)
+  
+    # Defining outcome and predictors 
+    Outcome<-data.imputed[,OutcomeName] 
+    modelMatrix.data <- model.Matrix(as.formula(paste(OutcomeName,"~.",sep="")),data.imputed)  
+    # X.data.train<-modelMatrix.data.train[,-1]  #predictors only (no intercept)
+    
+   
+    levels(Outcome) <- c("noEvent","Event")
+    
+    options(warn=-1)
+    
+    set.seed(seed)
+    cvIndex <- createMultiFolds(Outcome, k=innerFolds, times=innerRepeats)# for repeated startified CV
+    Fit.Caret <- train(x=modelMatrix.data[,-1] ,y=Outcome, method="glmnet",tuneGrid=Grid, family="binomial",            
+                       trControl=trainControl(method="repeatedcv", number=innerFolds,  repeats=innerRepeats, 
+                                              index = cvIndex,
+                                              selectionFunction="best",
+                                              summaryFunction = twoClassSummary, #optimizing with AUC instead of accuracy
+                                              classProbs = TRUE )) 
+    
+    
+    options(warn=0)
+    
+    
+    #- Tuning parameters
+    Lambdas<-c(best=Fit.Caret$bestTune$lambda,oneSE=max(Fit.Caret$results$lambda[max(Fit.Caret$results$ROC)-Fit.Caret$results$ROC <=
+                                                                            (Fit.Caret$results[row.names(Fit.Caret$bestTune),]$ROCSD)/sqrt(innerFolds*innerRepeats)]))
+    
+    #- Model coefficients -#
+    
+    coef.best <- as.matrix(coef(Fit.Caret$finalModel,s=Fit.Caret$bestTune$lambda))
+    coef.tol1SE <- as.matrix(coef(Fit.Caret$finalModel,s=max(Fit.Caret$results$lambda[max(Fit.Caret$results$ROC)-Fit.Caret$results$ROC <=
+                                                                                        (Fit.Caret$results[row.names(Fit.Caret$bestTune),]$ROCSD)/sqrt(innerFolds*innerRepeats)])))
+    coef<-data.frame(coef.best,coef.tol1SE)
+    names(coef)<-c("best","1SE")
+    
+    #-- Calculate apparent performance-- #
+    
+    Model.best = AppPerformanceKNNLassoLogistic(coef=coef.best,data=data.imputed, OutcomeName=OutcomeName)
+    Model.tol.1SE = AppPerformanceKNNLassoLogistic(coef=coef.tol1SE,data=data.imputed, OutcomeName=OutcomeName)
+    
+    
+    
+  ## Apparent performances
+  AppPerformances<-matrix(c(unlist(Model.best),unlist(Model.tol.1SE)),15,2,byrow=F)
+  
+  colnames(AppPerformances)<-c("best","1SE")
+  
+  row.names(AppPerformances)<-c("AUC","Alpha","Beta",
+                                 "sensBestThresh","specBestThresh",
+                                 "PPVBestThresh","NPVBestThresh",
+                                 "AccuracyBestThresh","KappaBestThresh",
+                                 "sens50Thresh","spec50Thresh",
+                                 "PPV50Thresh","NPV50Thresh",
+                                 "Accuracy50Thresh","Kappa50Thresh")
+  
+  out.temp <- list(ApparentPerformances=AppPerformances,Lambdas=Lambdas,coef=coef)
+  
+  out.temp
+  
+}
+
+```
+
+
+# Function(2): NestedCVKnnLassoLogisticValidation:
+
+```{r}
+# A function to compute optimism ################################
+testPerformanceKNNLassoLogistic<- function (coef,data.train,data.test,OutcomeName) {
+  
+  Outcome.train  <- unlist(data.train[,OutcomeName])
+  levels(Outcome.train) <- c("noEvent","Event")
+  Outcome.test  <- unlist(data.test[,OutcomeName])
+  levels(Outcome.test) <- c("noEvent","Event")
+  modelMatrix.train <- model.Matrix(as.formula(paste(OutcomeName,"~.",sep="")),data.train)  
+  X.train<-modelMatrix.train[,-1]   
+  modelMatrix.test <- model.Matrix(as.formula(paste(OutcomeName,"~.",sep="")),data.test)  
+  X.test<-modelMatrix.test[,-1]   
+  Predicted.train  <-  as.matrix(exp(coef[1] + X.train%*%coef[-1])/(exp(coef[1] + X.train%*%coef[-1])+1))
+  Predicted.train[Predicted.train==1]  <- 0.999999999
+  Predicted.train[Predicted.train==0]  <- 0.000000001
+  Predicted.test  <-  as.matrix(exp(coef[1] + X.test%*%coef[-1])/(exp(coef[1] + X.test%*%coef[-1])+1))
+  Predicted.test[Predicted.test==1]  <- 0.999999999
+  Predicted.test[Predicted.test==0]  <- 0.000000001
+  
+  
+  roc_obj.train <- roc(Outcome.train, as.vector(Predicted.train), quiet = TRUE)
+  bestThreshold.train<-pROC::coords(roc_obj.train, "best", ret = "threshold",transpose=T)
+  PredictedClass.test<-factor(Predicted.test>0.5); levels(PredictedClass.test)<-c("noEvent","Event")
+  confMatrix50threshold.test<-confusionMatrix(PredictedClass.test, Outcome.test, positive="Event")
+  sensitivity.test<-confMatrix50threshold.test$byClass["Sensitivity"]
+  specificity.test<-confMatrix50threshold.test$byClass["Specificity"]
+  PPV.test<-confMatrix50threshold.test$byClass["Pos Pred Value"]
+  NPV.test<-confMatrix50threshold.test$byClass["Neg Pred Value"]
+  Accuracy.test<-confMatrix50threshold.test$overall["Accuracy"]
+  Kappa.test<-confMatrix50threshold.test$overall["Kappa"]
+  
+  if(bestThreshold.train[1]==-Inf ){
+    sensitivityBest.test<-NA
+    specificityBest.test<-NA
+    PPVBest.test<-NA
+    NPVBest.test<-NA
+    AccuracyBest.test<-NA
+    KappaBest.test<-NA
+    
+  } else {
+    PredictedClassBest.test<-factor(Predicted.test>bestThreshold.train[1]); levels(PredictedClassBest.test)<-c("noEvent","Event")
+    confMatrixBestthreshold.test<-confusionMatrix(PredictedClassBest.test, Outcome.test, positive="Event")
+    sensitivityBest.test<-confMatrixBestthreshold.test$byClass["Sensitivity"]
+    specificityBest.test<-confMatrixBestthreshold.test$byClass["Specificity"]
+    PPVBest.test<-confMatrixBestthreshold.test$byClass["Pos Pred Value"]
+    NPVBest.test<-confMatrixBestthreshold.test$byClass["Neg Pred Value"]
+    AccuracyBest.test<-confMatrixBestthreshold.test$overall["Accuracy"]
+    KappaBest.test<-confMatrixBestthreshold.test$overall["Kappa"]
+  }
+  roc_obj.test <- roc(Outcome.test, as.vector(Predicted.test),quiet = TRUE)
+  AUC.test   <-as.numeric(roc_obj.test$auc)
+  logOdds.test<-log(Predicted.test/(1-Predicted.test))
+  glm.coef.test.beta       <-  glm(Outcome.test ~ logOdds.test,family=binomial)$coef
+  Beta.test	 <-  glm.coef.test.beta[2]
+  glm.coef.test.alpha       <-  glm(Outcome.test ~ offset(logOdds.test),family=binomial)$coef
+  Alpha.test  <-  glm.coef.test.alpha[1]
+  
+  out.best.tol  <- list(AUC.test,Alpha.test,Beta.test,
+                        sensitivityBest.test,specificityBest.test,
+                        PPVBest.test,NPVBest.test,AccuracyBest.test,
+                        KappaBest.test,sensitivity.test,
+                        specificity.test,PPV.test,NPV.test,
+                        Accuracy.test,Kappa.test)
+  out.best.tol
+}
+
+
+#________________________________________________________________________________________________________________________________________________________
+
+# MAIN FUNCTION ###########################################################################################
+
+NestedCVKnnLassoLogisticvalidation<- function (outerFolds,outerRepeats,innerFolds,innerRepeats,Data.NA,OutcomeName,Grid,seed){
+  
+  set.seed(seed)
+  seeds<-sample(1:10000000,outerFolds*outerRepeats)
+  set.seed(seed)
+  Cv.row <- createMultiFolds(Data.NA[,1],outerFolds,outerRepeats) #should create the 1000 folds for the 100 times repeated 10-cv
+  # inspect Cv.row as each repetition doesn't necessarily have 10 folds because of stratified sampling ####
+  if(outerRepeats<10){
+    numberFolds<-unlist(lapply(sprintf(".Rep%01d", 1:outerRepeats),function(x) length(grep(x,names(Cv.row)))))
+  } else if (outerRepeats<100){
+    numberFolds<-unlist(lapply(sprintf(".Rep%02d", 1:outerRepeats),function(x) length(grep(x,names(Cv.row)))))
+  } else {
+    numberFolds<-unlist(lapply(sprintf(".Rep%03d", 1:outerRepeats),function(x) length(grep(x,names(Cv.row)))))
+  }
+  N<-sum(numberFolds)
+  
+  All.sensitivityBest.best   <-All.sensitivityBest.tol1SE <-rep(NA,N)
+  All.specificityBest.best   <-All.specificityBest.tol1SE <-rep(NA,N)
+  All.PPVBest.best   <-All.PPVBest.tol1SE <-rep(NA,N)
+  All.NPVBest.best   <-All.NPVBest.tol1SE <-rep(NA,N)
+  All.AccuracyBest.best   <-All.AccuracyBest.tol1SE <-rep(NA,N)
+  All.KappaBest.best   <-All.KappaBest.tol1SE <-rep(NA,N)
+  All.sensitivity.best   <-All.sensitivity.tol1SE <-rep(NA,N)
+  All.specificity.best   <-All.specificity.tol1SE <-rep(NA,N)
+  All.PPV.best   <-All.PPV.tol1SE <-rep(NA,N)
+  All.NPV.best   <-All.NPV.tol1SE <-rep(NA,N)
+  All.Accuracy.best   <-All.Accuracy.tol1SE <-rep(NA,N)
+  All.Kappa.best   <-All.Kappa.tol1SE <-rep(NA,N)
+  All.AUC.test.best   <- All.AUC.test.tol1SE   <-   rep(NA,N)
+  All.Alpha.test.best  <- All.Alpha.test.tol1SE   <-    rep(NA,N)
+  All.Beta.test.best  <- All.Beta.test.tol1SE   <-  rep(NA,N)
+  
+  #Matrix for best performances in tuning
+  TuningROC<-matrix(NA,innerFolds*innerRepeats,N)
+  
+  #Matrix for tuning parameters
+  Lambdas<-matrix(NA,2,N,dimnames=list(c("Best","1SE"),NULL))
+  
+  f=1 #indexing the fold in numberFolds
+  while(f<=N){
+    print(f)
+    data.train<-Data.NA[Cv.row[[f]],]
+    data.test<-Data.NA[-Cv.row[[f]],]
+    
+    # KNN imputation ###########
+    
+    ### Imputing training sample through KNN including outcome
+    data.imputed.train<- knnImputation(data.train, k=10)
+    
+    ### Imputing the test data with the imputation model built on training data, by making the test outcome missing
+    data.test2<-data.test
+    data.test[,OutcomeName]<-NA
+    data.test[,OutcomeName]<-as.factor(data.test[,OutcomeName])
+    data.imputed.test<-knnImputation(data.test,k=10, distData=data.train)
+    
+    ### Adding the original outcome back to the imputed test data
+    
+    data.imputed.test[,OutcomeName]<-data.test2[,OutcomeName]
+    
+    # Defining outcome and predictors 
+    Outcome.train<-data.imputed.train[,OutcomeName] 
+    modelMatrix.data.train <- model.Matrix(as.formula(paste(OutcomeName,"~.",sep="")),data.imputed.train)  
+    # X.data.train<-modelMatrix.data.train[,-1]  #predictors only (no intercept)
+    
+    Outcome.test<-data.imputed.test[,OutcomeName]
+    modelMatrix.data.test <- model.Matrix(as.formula(paste(OutcomeName,"~.",sep="")),data.imputed.test)  
+    # X.data.test<-modelMatrix.data.test[,-1]  #predictors only (no intercept)
+    
+    levels(Outcome.train) <- c("noEvent","Event")
+    levels(Outcome.test) <- c("noEvent","Event")
+    
+    options(warn=-1)
+    
+    set.seed(seeds[f])
+    cvIndex <- createMultiFolds(Outcome.train, k=innerFolds, times=innerRepeats)# for repeated startified CV
+    Fit.Caret <- train(x=modelMatrix.data.train[,-1] ,y=Outcome.train, method="glmnet",tuneGrid=Grid, family="binomial",            
+                       trControl=trainControl(method="repeatedcv", number=innerFolds,  repeats=innerRepeats, 
+                                              index = cvIndex,
+                                              selectionFunction="best",
+                                              summaryFunction = twoClassSummary, #optimizing with AUC instead of accuracy
+                                              classProbs = TRUE )) 
+    
+    
+    options(warn=0)
+    
+    #- Best performances in tuning -#
+    TuningROC[,f]<-Fit.Caret$resample$ROC
+    
+    #- Tuning parameters
+    Lambdas[,f]<-c(Fit.Caret$bestTune$lambda,max(Fit.Caret$results$lambda[max(Fit.Caret$results$ROC)-Fit.Caret$results$ROC <=
+                                                                            (Fit.Caret$results[row.names(Fit.Caret$bestTune),]$ROCSD)/sqrt(innerFolds*innerRepeats)]))
+    
+    #- Model coefficients -#
+    
+    coef.best <- as.matrix(coef(Fit.Caret$finalModel,s=Fit.Caret$bestTune$lambda))
+    coef.tol1SE <- as.matrix(coef(Fit.Caret$finalModel,s=max(Fit.Caret$results$lambda[max(Fit.Caret$results$ROC)-Fit.Caret$results$ROC <=
+                                                                                        (Fit.Caret$results[row.names(Fit.Caret$bestTune),]$ROCSD)/sqrt(innerFolds*innerRepeats)])))
+    
+    
+    #-- Calculate optimism and calibration slope (beta)-- #
+    
+    Model.best = testPerformanceKNNLassoLogistic(coef=coef.best,data.train=data.imputed.train,data.test=data.imputed.test, OutcomeName=OutcomeName)
+    Model.tol.1SE = testPerformanceKNNLassoLogistic(coef=coef.tol1SE,data.train=data.imputed.train,data.test=data.imputed.test, OutcomeName=OutcomeName)
+    
+    
+    All.AUC.test.best[f]    <- Model.best[[1]] 
+    All.Alpha.test.best[f]       <- Model.best[[2]]
+    All.Beta.test.best[f]        <- Model.best[[3]]
+    All.AUC.test.tol1SE[f]       <- Model.tol.1SE[[1]] 
+    All.Alpha.test.tol1SE[f]          <- Model.tol.1SE[[2]]
+    All.Beta.test.tol1SE[f]   	       <- Model.tol.1SE[[3]]
+    
+    All.sensitivityBest.best[f]<- Model.best[[4]] 
+    All.sensitivityBest.tol1SE[f]<- Model.tol.1SE[[4]]
+    
+    All.specificityBest.best[f]  <- Model.best[[5]] 
+    All.specificityBest.tol1SE[f] <-Model.tol.1SE[[5]]
+    
+    All.PPVBest.best[f]   <- Model.best[[6]] 
+    All.PPVBest.tol1SE[f]<-Model.tol.1SE[[6]]
+    
+    All.NPVBest.best[f]  <- Model.best[[7]] 
+    All.NPVBest.tol1SE[f] <-Model.tol.1SE[[7]]
+    
+    All.AccuracyBest.best[f]   <- Model.best[[8]] 
+    All.AccuracyBest.tol1SE[f]<-Model.tol.1SE[[8]]
+    
+    All.KappaBest.best[f]  <- Model.best[[9]] 
+    All.KappaBest.tol1SE[f] <-Model.tol.1SE[[9]]
+    
+    All.sensitivity.best[f]  <- Model.best[[10]] 
+    All.sensitivity.tol1SE[f] <-Model.tol.1SE[[10]]
+    
+    All.specificity.best[f] <- Model.best[[11]] 
+    All.specificity.tol1SE[f] <-Model.tol.1SE[[11]]
+    
+    All.PPV.best[f]   <- Model.best[[12]] 
+    All.PPV.tol1SE[f] <-Model.tol.1SE[[12]]
+    
+    All.NPV.best[f]  <- Model.best[[13]] 
+    All.NPV.tol1SE[f] <-Model.tol.1SE[[13]]
+    
+    All.Accuracy.best[f]  <- Model.best[[14]] 
+    All.Accuracy.tol1SE[f] <-Model.tol.1SE[[14]]
+    
+    All.Kappa.best[f]   <- Model.best[[15]] 
+    All.Kappa.tol1SE[f] <-Model.tol.1SE[[15]]
+    
+    # #Saving performance
+    # 
+    # if(f==1){
+    #   write(t(cbind(unlist(Model.best),unlist(Model.tol.1SE))),file = "NestedCV.txt",append = FALSE, ncolumns=2)
+    # } else {
+    #   write(t(cbind(unlist(Model.best),unlist(Model.tol.1SE))),file = "NestedCV.txt",append = TRUE, ncolumns=2)
+    # }
+    
+    f<-f+1
+  } 
+  ## Average test performances
+  testPerformances<-matrix(c(mean(All.AUC.test.best, na.rm = T),mean(All.AUC.test.tol1SE, na.rm = T),
+                             mean(All.sensitivityBest.best,na.rm=T),mean(All.sensitivityBest.tol1SE,na.rm=T),
+                             mean(All.specificityBest.best,na.rm=T),mean(All.specificityBest.tol1SE,na.rm=T) ,
+                             mean(All.PPVBest.best,na.rm=T),mean(All.PPVBest.tol1SE,na.rm=T),
+                             mean(All.NPVBest.best,na.rm=T),mean(All.NPVBest.tol1SE,na.rm=T),
+                             mean(All.AccuracyBest.best,na.rm=T),mean(All.AccuracyBest.tol1SE,na.rm=T),
+                             mean(All.KappaBest.best,na.rm=T),mean(All.KappaBest.tol1SE,na.rm=T),
+                             mean(All.sensitivity.best,na.rm=T),mean(All.sensitivity.tol1SE,na.rm=T),
+                             mean(All.specificity.best,na.rm=T),mean(All.specificity.tol1SE,na.rm=T),
+                             mean(All.PPV.best,na.rm=T),mean(All.PPV.tol1SE,na.rm=T),
+                             mean(All.NPV.best,na.rm=T),mean(All.NPV.tol1SE,na.rm=T) ,
+                             mean(All.Accuracy.best,na.rm=T),mean(All.AccuracyBest.tol1SE,na.rm=T),
+                             mean(All.Kappa.best,na.rm=T),mean(All.Kappa.tol1SE,na.rm=T),
+                             mean(All.Beta.test.best,na.rm=T),mean(All.Beta.test.tol1SE,na.rm=T),
+                             mean(All.Alpha.test.best,na.rm=T),mean(All.Alpha.test.tol1SE,na.rm=T)),15,2,byrow=TRUE)
+  
+  colnames(testPerformances)<-c("best","1SE")
+  
+  row.names(testPerformances)<-c("Av.AUC","Av.sensBestThresh","Av.specBestThresh",
+                                 "Av.PPVBestThresh","Av.NPVBestThresh",
+                                 "Av.AccuracyBestThresh","Av.KappaBestThresh",
+                                 "Av.sens50Thresh","Av.spec50Thresh",
+                                 "Av.PPV50Thresh","Av.NPV50Thresh",
+                                 "Av.Accuracy50Thresh","Av.Kappa50Thresh",
+                                 "Av.Beta","Av.Alpha")
+  
+  out.temp <- list(testPerformances=testPerformances,TuningROC=TuningROC,Lambdas=Lambdas)
+  
+  out.temp
+  
+}
+
+```
+
+
+# 1.1) Importing data and data manipulation:
+
+## Importing data
+```{r}
+df <- read_sav("C:/Users/xxxx/Desktop/KCL/Prediction Modeling/TBI 24 02 .sav")
+View(df)
+```
+## Removing additional(2) outcomes:
+``` {r}
+df = subset(df,select=-c(d.gos, d.mort))
+View(df)
+```
+## Formatting categorical variables:
+```{r}
+df$trial <- factor(df$trial)
+df$d.unfav <- factor(df$d.unfav)
+df$cause <- factor(df$cause)
+```
+
+## Creating dataset to be used in complete case analysis:
+```{r}
+# Dropping non-truncated variables and the imputed pupillary reaction variable
+df.dr <- subset(df,select=-c(pupil.i, glucose, sodium, hb))
+# Removing all cases with missing values
+df.nona <- df.dr[apply(df.dr,1,FUN=function(x) sum(is.na(x)))==0,]
+View(df.nona)
+```
+
+## Summary statistics on remaining variables:
+
+```{r}
+summary(df.nona)
+```
+
+
+# 1.2) Sample Size & Complete Case Regressions:
+## Task 1: Sample Size Calculations:
+
+Sample size calculations to determine the minimum sample size required for the development of the multivariate prediction model were run based on recommendations from Riley et al. (2020) and using the pmsampsize (v1.0.3; Ensor, Martin & Riley, 2020) package. 
+
+Full Citation:
+
+``` {r}
+citation("pmsampsize")
+```
+  
+Joie Ensor, Emma C. Martin and Richard D. Riley (2020). pmsampsize: Calculates the Minimum Sample Size Required for Developing a Multivariable Prediction Model. R package version 1.0.3.
+https://CRAN.R-project.org/package=pmsampsize)
+
+For binary outcomes Riley et al. (2018) outline the following 3 criteria that the sample size should meet in order to minimise overfitting and ensure the precise estimation of parameters in the model:
+(i)   Criteria 1: sample size is sufficient to estimate the overall outcome proportion with     ,                 sufficient precision.
+(ii)  Criteria 2: sample size is sufficient to target a shrinkage factor of 0.9.
+(iii) Criteria 3: sample size is sufficient to target a small optimism of 0.05 in the apparent  .                 R-squared.
+
+The sample size calculation requires the prespecification of the anticipated R-squared of the model (in this case a conservative estimate of Nagelkerke’s r-squared value of 0.2 was used) along with the expected outcome proportion in the development sample based on previous studies in the same population (taken to be 0.41 here, as indicated in the literature - see Styerberg et al. 2008).
+
+```{r}
+#Prevalence: specifies the overall outcome proportion - 0.41 (see Styerberg et. al, 2008)
+sum(df.nona$trial == 75) ## sample size of training/development set = 545
+
+sum(df.nona$trial == 75 & df.nona$d.unfav == 1) ## events in training set = 211
+
+pmsampsize(type = "b", rsquared = 0.2, parameters = 20, prevalence = 0.41)
+#Number of parameters: (1) intercept + (15) continuous/ordinal outcomes + (4) 5 levels of 1 nominal var (cause) = 20
+```
+
+Results show that we would need a sample size of 796 to develop the prediction model, whereby there are at least 327 events and 16.32 events per candidate predictor (EPP). However, the sample size of our training set is 545 and there are 211 events, suggesting that there might be some overfitting. With the sample size at hand, the maximum number of parameters we could estimate is around 11. 
+
+## Task 2: Simple Logistic Regression:
+
+* Question: Assuming that this is the only analyses we perform: Why can we say that we have externally validated our model by using this approach? What may be a disadvantage of this approach? 
+* Answer:   We can say that we have externally validated our model because we did a non-random split of the sample (based on the trial). One disadvantage of splitting the dataset is the decrease in the sample size of the development set.
+
+### Splitting the dataset into training and test sets
+```{r}
+df.nona.tr <- filter(df.nona,trial==75) # Creating the training set from the US trial dataset
+df.nona.tr <- subset(df.nona.tr,select=-c(trial)) # Removing the trial column
+df.nona.tst <- filter(df.nona,trial==74) # Creating the test set from the international dataset
+df.nona.tst <- subset(df.nona.tst,select=-c(trial)) # Removing the trial column
+```
+
+### Simple Logistic Regression on Training Set:
+```{r}
+simplelogit.tr <-glm(d.unfav~.,family = binomial, data = df.nona.tr)
+summary(simplelogit.tr)
+
+# Obtaining ORs & 2.5thile + 97.5thile CIs for the ORs
+options(scipen = 999)
+exp(cbind(OR = coef(simplelogit.tr), confint(simplelogit.tr)))
+```
+
+### External Validation on Test (International) Dataset:
+```{r}
+# Predicting probability for TBI in test set based on training model
+glm_test_prob = predict(simplelogit.tr, newdata = df.nona.tst[,-1], type = "response" ) 
+
+# Using predicted probabilities to get at predicted cases at 0.5 threshold 
+pred.test <- ifelse(glm_test_prob>=0.5,1,0) 
+glm_test_prob[1:10]
+pred.test[1:10]
+
+# Calculating ROC Curve and AuC in test set: 
+roc.te <- roc(as.factor(df.nona.tst$d.unfav), glm_test_prob,quiet=T)
+roc.te$auc ## Area under the curve: 0.799
+
+plot.roc(roc.te, print.auc=T, print.thres=c(seq(0.05,0.35,0.05),0.074), print.thres.pch=0.1) ## ROC plot with thresholds
+plot.roc(roc.te, print.auc=T) ## ROC plot without thresholds
+
+# AUC confidence interval - test dataset
+ci.auc(roc.te) #95% CI: 0.76-0.84
+
+# Obtaining additional validity measures through ConfusinMatrix (where threshold is taken to be 0.5)
+(confMatrix50Threshold.ext.te<-confusionMatrix(as.factor(pred.test), as.factor(df.nona.tst$d.unfav), positive="1"))
+
+```
+
+* Question: How good is the prediction accuracy based on the AUC for the external test set? 
+* Answer : Based on the obtained AUC value in the external test set, the prediction accuracy of the simple logistic model is fair/good.
+
+#1.3) 
+## Task 3: Prediction Model Using Regularized Logistic Regression:
+
+* Question: If we compare the performance of the three models (glm, lasso with min and lasso with min+1SE) on the test (external) data and select a best one, can we still regard the performance as true external validity? 
+* Answer: It could be argued that the performance on the external dataset is not the true external performace because it has been used for model development/selection. That is the external dataset was used to infrom the method for model development.
+
+### Preparing the data:
+```{r}
+# Creating an x and y file to be used for glmnet
+x = subset(df.nona.tr, select= -c(d.unfav)) ## predictors
+y = as.factor(df.nona.tr$d.unfav) ## outcome
+# Dummy coding factor predictor variables to be used in glmnet
+x <- model.matrix(~.-1, data=x)
+# Ensuring that the outcome is a factor
+is.factor(y)
+#Checking that all is correct
+summary(x)
+summary(y)
+```
+### Model Selection - Using Cross-Validation
+
+```{r}
+glmmod <- glmnet(x, y=y, alpha=1, family="binomial") ## alpha = 1 for LASSO
+plot(glmmod, xvar="lambda")
+
+# Selecting the best lambda by cross validation
+set.seed(123) 
+cv.glmmod <- cv.glmnet(x, y, alpha=1, family = "binomial", type.measure = "dev")
+plot(glmmod, xvar="lambda")
+
+# Storing the best lambdas obtained by cross validation
+lmin <- cv.glmmod$lambda.min ## Minimum Lambda
+l1se <- cv.glmmod$lambda.1se ## Minimum + 1SE Lambda
+
+# Storing Coefficients for best lambdas
+coef.min_cv <- coef(cv.glmmod, s="lambda.min") ## coeffs from min lambda model
+colSums(coef.min_cv != 0) # 14 variables were selected with the minimum lambda
+
+coef.min.1se_cv <- coef(cv.glmmod, s="lambda.1se") ## coeefs from min lambda + 1SE
+colSums(coef.min.1se_cv != 0) ## 10 variables were selected with min lambda + 1SE 
+```
+### Model Selection Using Repeated Cross-Validation: Minimum Lambda
+```{r}
+# Labeling levels of factor variable (outcome) for use in Caret:
+df.nona.tr$d.unfav <- as.numeric(df.nona.tr$d.unfav)
+df.nona.tr$d.unfav <- as.factor(df.nona.tr$d.unfav)
+levels(df.nona.tr$d.unfav) <- c("No","Yes")
+# Setting up number of cores:
+cl=makeCluster(4); registerDoParallel(cl)
+# Setting up training setting objects
+set.seed(123)
+trControl.min <- trainControl(method = "repeatedcv", # Repeated Cross-validation
+                          repeats = 10,              # Number of Repeated CV
+                          number = 10,               # Number of Folds
+                          summaryFunction = twoClassSummary, # Using AuC to compute performance
+                          classProbs = TRUE,     
+                          savePredictions = "all",
+                          allowParallel = TRUE,
+                          selectionFunction = "best", # Minimum Lambda
+                          )
+# Setting up grid of parameters to test
+params = expand.grid(alpha=c(1), 
+                     lambda=2^seq(1,-10,by=-0.1)) ## Regularization parameter
+# Running the training over the tuneGrid and selcting the best model 
+set.seed(123)
+glmnet.object.min <- train(d.unfav ~ .,            # Model Formula
+                       data = df.nona.tr,          # Training dataset 
+                       method = "glmnet",      
+                       metric = "ROC",             # Optimizing AUC
+                       family = "binomial",        # Logistic Regressions
+                       trControl = trControl.min,  # Training settings (defined previously)
+                       tuneGrid = params)          # Grid of parameters to test over
+# Stopping use of the cores
+stopCluster(cl)
+
+# Plotting performance for different parameters:
+plot(glmnet.object.min, xTrans=log, xlab = "log(lambda)")
+# Plotting regularization paths for the best (minimum lambda) model
+plot(glmnet.object.min$finalModel, xvar="lambda", label = T)
+# Summary of main results
+print(glmnet.object.min)
+# Content of the object
+summary(glmnet.object.min)
+# Retrieving Key Output
+get_best_result = function(caret_fit) {
+  best = which(rownames(caret_fit$results) == rownames(caret_fit$bestTune))
+  best_result = caret_fit$results[best, ]
+  rownames(best_result) = NULL
+  best_result
+}
+# Model Coefficients for model with minimum lambda using repeated CV
+best_lambda.min <- get_best_result(glmnet.object.min)$lambda # getting best lambda
+best_lambda.min ## minimum lambda = 0.018
+coef.min<-coef(glmnet.object.min$finalModel, glmnet.object.min$bestTune$lambda)  # storing coeffs of best model 
+coef.min ## These are the coeffs for the final model with the optimized for minimum lambda
+colSums(coef.min!=0) ## 12 coefficients => 11 variables selected with minimum lambda using CV (-1 intercept)
+
+# Getting best alpha
+best_alpha.min <- get_best_result(glmnet.object.min)$alpha 
+
+```
+
+
+### External Validity of Minimum Lambda Model
+```{r}
+x.test <- subset(df.nona.tst,select=-c(d.unfav)) ## subsetting predictors in test set
+df.nona.tst$d.unfav <- as.numeric(df.nona.tst$d.unfav)
+df.nona.tst$d.unfav <- as.factor(df.nona.tst$d.unfav)
+levels(df.nona.tst$d.unfav) <- c("No","Yes") ## labelling values of outcome variable 
+# Getting predicted probabilities and classes in test set
+pred_prob_min_tst <- (predict(glmnet.object.min,s=best_lambda.min, alpha=best_alpha.min, type="prob", newdata = x.test))
+pred_class_min_tst <-(predict(glmnet.object.min,s=best_lambda.min, alpha=best_alpha.min, type="raw",newdata=x.test))
+# Model prediction performance
+confusionMatrix(pred_class_min_tst, df.nona.tst$d.unfav, positive = "Yes")
+# RoC - AUC calculations
+roc_obj.test.min <- roc(df.nona.tst$d.unfav, (pred_prob_min_tst$Yes),  levels= c("No", "Yes"), quiet=TRUE)
+roc_obj.test.min$auc ## AUC 0.81
+
+# AUC confidence interval - test dataset
+ci.auc(roc_obj.test.min) #95% CI: 0.77 - 0.84 
+
+# ROC curve
+plot(roc_obj.test.min,print.auc=TRUE)
+```
+### Model Selection Using Repeated Cross-Validation: Minimum Lambda + 1SE
+```{r}
+# Setting up number of cores:
+cl=makeCluster(4); registerDoParallel(cl)
+# Setting up training setting objects
+trControl.1SE <- trainControl(method = "repeatedcv", # Repeated Cross-validation
+                              repeats = 10,              # Number of Repeated CV
+                              number = 10,               # Number of Folds
+                              summaryFunction = twoClassSummary, # Using AuC to compute performance across samples
+                              classProbs = TRUE,     
+                              savePredictions = "all",
+                              allowParallel = TRUE,
+                              selectionFunction = "oneSE", # Minimum Lambda + 1SE
+                              )
+# Setting up grid of parameters to test
+params = expand.grid(alpha=c(1), 
+                     lambda=2^seq(1,-10,by=-0.1)) ## Regularization parameter
+# Running the training over the tuneGrid and selcting the best model 
+set.seed(123)
+glmnet.object.1SE <- train(d.unfav ~ .,            # Model Formula
+                       data = df.nona.tr,          # Training dataset 
+                       method = "glmnet",      
+                       metric = "ROC",             # Optimizing AUC
+                       family = "binomial",        # Logistic Regressions
+                       trControl = trControl.1SE,  # Training settings (defined previously)
+                       tuneGrid = params)          # Grid of parameters to test over
+# Stopping use of the cores
+stopCluster(cl)
+
+# Plotting performance for different parameters:
+plot(glmnet.object.1SE, xTrans=log, xlab = "log(lambda)")
+# Plotting regularization paths for the best (minimum lambda) model
+plot(glmnet.object.1SE$finalModel, xvar="lambda", label = T)
+# Summary of main results
+print(glmnet.object.1SE)
+# Retrieving Key Output
+get_best_result = function(caret_fit) {
+  best = which(rownames(caret_fit$results) == rownames(caret_fit$bestTune))
+  best_result = caret_fit$results[best, ]
+  rownames(best_result) = NULL
+  best_result
+}
+# Model Coefficients for model with minimum lambda + 1SE using repeated CV
+best_lambda.1SE <- get_best_result(glmnet.object.1SE)$lambda # getting MIN lambda + 1SE
+coef.1SE<-coef(glmnet.object.1SE$finalModel, glmnet.object.1SE$bestTune$lambda)  # storing coeffs of minimum lambda + 1SE model 
+coef.1SE ## these are the coefficients for the final model for min lambda + 1SE
+colSums(coef.1SE!=0) ## 10 coeffs => 10-1 = 9 variables selected with minimum lambda + 1SE using repeated CV
+
+# Best alpha
+best_alpha.1SE <- get_best_result(glmnet.object.1SE)$alpha
+
+# Summary of Final Model with alpha = 1 and lambda= min lambda + 1SE = 0.038 (fit to the entire dataset)
+print(glmnet.object.1SE)
+```
+### External Validation of min lambda + 1SE model:
+```{r}
+## Predicted Probabilities
+pred_prob_1se_test <- predict(glmnet.object.1SE, s= best_lambda.1SE, alpha = best_lambda.1SE, type = "prob", newdata = x.test)
+## Predicted Classes
+pred_class_1se_test <- predict(glmnet.object.1SE, s=best_lambda.1SE,alpha = best_alpha.1SE, type = "raw", newdata = x.test)
+
+# Model prediction performance
+confusionMatrix(pred_class_1se_test, df.nona.tst$d.unfav, positive = "Yes")
+# RoC - AUC calculations
+roc_obj.test.1se <- roc(df.nona.tst$d.unfav, (pred_prob_min_tst$Yes),  levels= c("No", "Yes"))
+roc_obj.test.1se$auc
+
+# AUC confidence interval - test dataset
+ci.auc(roc_obj.test.1se) #95% CI: 0.77 - 0.84 
+
+# ROC curve
+plot(roc_obj.test.min)
+```
+
+* Question: Which of the three models would you recommend to a clinician? Please explain and give two reasons. If you choose Lasso, please state which of the two (minimum lambda or Lambda + 1 Se) 
+Note: There is no “right” answer
+* Answer:  I would recommend the use of the regularized logistic regression model, more specifically the minimum lambda LASSO model. To begin with, the sample size calculations carried out indicated that our prediction model is likely to overfit the data and using regularized regression methods can help address this. Additionally, the LASSO regression methods allow for automatic variable selection, thereby dropping the number of predictors involved in the prediction. This makes the model more practical to use in clinical settings. Finally, when comparing the two LASSO models, while there isn’t a substantial difference between the performance of the two models, overall, the model with the minimum lamda does seem to perform [slightly] better. 
+
+# 1.4) Abstract
+##################################################################################################
+      Predicting Traumatic Brain Injury Outcomes: Development and Validation of a Prognostic Model
+##################################################################################################
+
+Traumatic Brain Injury (TBI) is commonly cited as a cause of death and disability worldwide. The early prediction of the outcome of TBI based on hospital admission characteristics can play a critical role in supporting clinical decision making. The primary aim of this study was to develop a validated prognostic model to predict unfavourable outcome after TBI at 6 months using information that is readily available upon admission to hospital. A total of 1,111 patients with complete data from a trial in the US and a second international trial were included in the derivation (n= 545) and external validation (n=566) datasets, respectively. A total of 16 predictor variables available at hospital admission were included in the prediction models. Sample size analysis were carried out to determine the minimum sample size required for the development of the multivariate prediction model. We compared the predictive performance of several statistical and machine learning algorithms on the external test set to select a final model. More specifically we ran a standard regression and regularized logistic regressions (LASSO models) with (i) minimum lambda and (ii) minimum lambda + 1SE tuning parameters optimized via repeated cross validation. Sample size calculations indicated that the available sample size and event per candidate ratio were not sufficient for a well-performing model and that there may be some overfitting. Overall, the three models performed rather similarly on measures of accuracy, sensitivity and specificty. However, the regularized models showed improved discrimination with an AuC of 0.81 (95% CI: 0.77-0.84) as compared to the standard logistic regression (AuC: 0.79; 95% CI: 0.76 - 0.84). Moreover, the minimum lambda model showed slightly better performance on the external test set as compared to the minimum lambda + 1SE model on, such as sensitivity (0.52 and 0.47, respectively). As such, we recommend the use of the LASSO model tuned for the minimum lambda to address problems in overfitting and to limit the number of predictors used in the model, thereby making it more practical for clinical use. The study at hand does suffer from a few drawbacks. For example, we did not explore patterns of missingness in the data in an effort to impute missing values and instead carried out complete case analyses. This is a drawback insofar as missingness mechanisms that may influence prediction accuracy were not explored. Moreover, while performance was assessed by means of various metrics, calibration, which is considered to be a key metric in model validation, was not assessed. The developed prediction model can prove to be a useful tool within hospital settings to support clinical decision making and can be considered in conjuction with other similarly developed models.
+
+##################################################################################################
+Key Words: Traumatic Brain Injury (TBI); External Validation; Prognostic Modelling, Clinical Prediction Model, Head Injury
+##################################################################################################
+
+
+
+# 1.5) Logistic Lasso with Missing Values: KNN-Logistic-Lasso
+
+### Data Manipulation:
+```{r}
+# Reimporting dataset
+df.2 <- read_sav("C:/Users/lila_/Desktop/KCL/Prediction Modeling/TBI 24 02 .sav")
+# Formatting df.2 to a data.frame() structure
+df.2 <- as.data.frame(df.2)
+# Dropping additional outcome variables and nontruncated/imputed predictors
+df.2 = subset(df.2, select=-c(d.gos, d.mort,pupil.i, glucose, sodium, hb, trial))
+# Formatting categorical vars to factors
+df.2$d.unfav <- factor(df.2$d.unfav)
+df.2$cause <- factor(df.2$cause)
+# Summary of remaining variables
+summary(df.2)
+```
+### Exploring missingness:
+```{r}
+
+sum(complete.cases(df.2)) # total number of 1111 complete cases
+
+(sum(apply(is.na(df.2),1,sum)==0)/dim(df.2)[1])*100 #51.46% complete cases-- this is less than the recommended 60% of complete cases
+
+## Missing data in the preditors
+apply(is.na(df.2),2,sum)# number of missing data per variable
+(mean(apply(is.na(df.2),2,sum))/dim(df.2)[1])*100 # 4.65% percentage of missing data overall
+
+## Missing data in the outcome
+sum(is.na(df.2$d.unfav)) # None
+
+```
+
+### Imputation & Model Tuning:
+```{r}
+options("scipen"=100, "digits"=10)
+## Defining tuning grid for lambda
+Grid <- expand.grid(alpha = 1 , lambda= 10^seq(0.5,-2,length=40))
+
+
+## Running KNN-Logistic-Lasso
+cl=makeCluster(4);registerDoParallel(cl) #setting up number of cores
+(KNN.LASSO.Model<-KnnLassoLogistic(innerFolds=5,innerRepeats=20,Data.NA=df.2,OutcomeName="d.unfav",Grid=Grid,seed=123))
+
+stopCluster(cl)
+
+# Apparent Performance
+KNN.LASSO.Model$ApparentPerformances
+
+# Best Lambdas
+KNN.LASSO.Model$Lambdas 
+
+# Coefficients
+KNN.LASSO.Model$coef ## coefficients for final model
+
+sum(KNN.LASSO.Model$coef$best != 0)
+# 14 coeffs (including intercept) overall and 13 variables were selected in the minimum lambda model
+
+sum(KNN.LASSO.Model$coef$`1SE` != 0) # 13 coeffs (including intercept) and 12 variables were selected in the minimum + 1SE model
+
+```
+
+### Assessing Internal Validity of KNN-Logistic-LASSO model:
+```{r}
+cl=makeCluster(4);registerDoParallel(cl) ## setting up number of cores
+(NestedCVKnnLogValidation <-NestedCVKnnLassoLogisticvalidation(outerFolds=5,outerRepeats=1,innerFolds=5,innerRepeats=20,Data.NA=df.2,OutcomeName="d.unfav",Grid=Grid,seed=123)) # nested cross validation KNN Logistic Lasso
+stopCluster(cl)
+
+## Accuracy measures:
+NestedCVKnnLogValidation$testPerformances
+```
+* Question:  How many and which variables are selected (2 points)? In addition, please present internally validated calibration slope and alpha estimates (2 points). 
+* Answer: In the final model with the minimum lambda, 13 variables were selected- these were: CAUSE9, AGE,D.MOTOR, D.PUPIL, HYPOXIA, HYPOTENS, CTCLASS, TSAH, EDH, CISTERNS, GLUCOSET, PH, HBT. The PH variable was additionally dropped in the minimum lambda + 1SE model. The internally validated calibration slope was 1.12 for the minimum lambda model and 1.28 for the minimum lambda + 1SE model. The internally validated alpha (calibration in the large) was estimated at around 0 for both the minimum and minimum + 1SE models. 
+
+* Question: Please summarize your model. Does it show good discrimination (AUC) and calibration (calibration slope and alpha)? 
+* Answer: Answer: Overall, the model does show good discrimination (AuC =  0.81). The internally validated calibration slope is slightly above 1, suggesting that the model might slight underfit the data. One way to address this would be to recalibrate the model. 
+
+
+****************
+References:
+Steyerberg EW, Mushkudiani N, Perel P, Butcher I, Lu J, McHugh GS, et al. (2008) Predicting Outcome after Traumatic Brain Injury: Development and International Validation of Prognostic Scores Based on Admission Characteristics. PLoS Med 5(8): e165. https://doi.org/10.1371/journal.pmed.0050165
